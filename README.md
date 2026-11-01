@@ -2,7 +2,7 @@
 
 Practical MQTT examples for firmware and external software clients connecting directly to SCADALGERIA.
 
-📘 **Start with the [SCADALGERIA Quick Start](https://github.com/Belalia-Industries/SCADALGERIA-Launch-Site/blob/main/docs/en/quick-start.mdx).**
+📘 **Start with the [SCADALGERIA Quick Start](https://scadalgeria.com).**
 
 ## 🚀 Provision once, use the same pattern in every language
 

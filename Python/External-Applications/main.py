@@ -1,421 +1,653 @@
 """
-Minimal SCADALGERIA External MQTT Tool
+SCADALGERIA Direct Firmware example — Raspberry Pi 5 / Python
 
-The program:
-    1. Connects to SCADALGERIA.
-    2. Authenticates using the SCADALGERIA MQTT challenge.
-    3. Sends one sine-wave telemetry value every second.
-    4. Receives commands from SCADALGERIA.
-    5. Executes supported commands.
-    6. Sends command results back to SCADALGERIA.
+This single file demonstrates the complete device-side MQTT lifecycle:
 
-Default sine wave:
-    center    = 50
-    amplitude = 40
-    period    = 300 seconds
+    1. Load the Connection Copy JSON and the separately supplied API key.
+    2. Open MQTT 3.1.1 with CleanSession=true.
+    3. Complete the SCADALGERIA HMAC challenge/response.
+    4. Derive the per-session AES-256-GCM key.
+    5. Read one digital input and publish encrypted telemetry.
+    6. Receive and decrypt one digital-output command.
+    7. Apply the output only after validation and deduplication.
+    8. Publish the encrypted command result.
+    9. Repeat authentication after every MQTT reconnect.
 
-Therefore:
-    minimum = 10
-    maximum = 90
-    one complete wave = 5 minutes
+Hardware used by the snippet:
+
+    BCM17 -> active-low digital input -> SCADALGERIA tag "di.input1"
+    BCM27 -> digital output          <- SCADALGERIA tag "do.output1"
+
+This is intentionally a protocol + GPIO example, not a complete deployment.
+The surrounding application still owns OS service management, watchdogs,
+network provisioning, OTA, secret provisioning, and production diagnostics.
 """
 
 
-# =====================================================================
-# STEP 1 OF 9 — IMPORTS
+# ============================================================================
+# STEP 1 OF 9 — IMPORTS AND TARGET NOTES
 #
-# These are the only libraries needed by this example.
+# The example uses normal ecosystem packages rather than a fictional
+# SCADALGERIA SDK:
 #
-# math:
-#     Generates the sine wave.
+#   paho-mqtt     -> MQTT 3.1.1 transport
+#   msgpack       -> SCADALGERIA MessagePack DTO arrays
+#   cryptography  -> HMAC/HKDF/AES-GCM support
+#   gpiod         -> Raspberry Pi 5 GPIO character-device access
 #
-# time / os / uuid / base64 / hashlib / hmac / struct:
-#     Handle timing, identity, authentication, sequence numbers and crypto.
-#
-# msgpack:
-#     SCADALGERIA uses MessagePack for MQTT payloads.
-#
-# paho.mqtt:
-#     MQTT client.
-#
-# cryptography:
-#     HKDF-SHA256 and AES-256-GCM required by SCADALGERIA.
-# =====================================================================
+# The companion README pins the package versions used by this example.
+# ============================================================================
 
-import base64
 import hashlib
 import hmac
-import math
+import json
 import os
+import secrets
 import struct
+import threading
 import time
-import uuid
+from pathlib import Path
 
+import gpiod
 import msgpack
 import paho.mqtt.client as mqtt
-
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from gpiod.line import Bias, Direction, Value
 
 
-# =====================================================================
-# STEP 2 OF 9 — VALUES FROM SCADALGERIA
+# ============================================================================
+# STEP 2 OF 9 — CONNECTION COPY JSON + API KEY SECRET
 #
-# Put all information obtained from SCADALGERIA here.
+# Public provisioning model used by every example in this repository:
 #
-# MQTT_HOST:
-#     IP address or hostname where the SCADALGERIA Engine MQTT listener
-#     is exposed.
+#   1. In the Connection menu, choose "Copy firmware configuration" →
+#      "Copy JSON" and save the non-secret document as
+#      `scadalgeria-connection.json`.
+#   2. Supply the source-bound API-key secret separately. For this host example
+#      it comes from the SCADALGERIA_API_KEY environment variable.
 #
-# MQTT_PORT:
-#     MQTT TCP port.
-#
-# TENANT_ID:
-#     Your SCADALGERIA tenant.
-#
-# PROJECT_ID:
-#     The project containing this source.
-#
-# SOURCE_ID:
-#     The source/connection configured in SCADALGERIA.
-#
-# API_KEY_ID:
-#     ID of the API key assigned to this MQTT source.
-#
-# API_KEY_SECRET:
-#     The one-time API-key Token issued by SCADALGERIA.
-#
-# TAG_ADDRESS:
-#     Address configured for this source in SCADALGERIA.
-# =====================================================================
+# The copied JSON is authoritative for broker, username, key ID, topic
+# templates, exact telemetry/command topics, QoS, policies, and tag metadata.
+# The API key secret is deliberately NOT present in that JSON.
+# ============================================================================
 
-MQTT_HOST = "your-vps-ip-or-domain"
-MQTT_PORT = 1883
-
-TENANT_ID = "00000000-0000-0000-0000-000000000001"
-PROJECT_ID = "00000000-0000-0000-0000-000000000002"
-
-SOURCE_ID = "python-sine-generator"
-
-API_KEY_ID = "00000000-0000-0000-0000-000000000003"
-API_KEY_SECRET = "your-api-key-token"
-
-TAG_ADDRESS = "sine_wave"
-
-
-# =====================================================================
-# STEP 3 OF 9 — LOCAL APPLICATION SETTINGS
-#
-# These values belong to this Python application rather than SCADALGERIA.
-#
-# A value is sent every 1 second.
-#
-# A period of 300 seconds means:
-#
-#     300 samples / cycle
-#     5 minutes / complete sine wave
-#
-# With:
-#
-#     center    = 50
-#     amplitude = 40
-#
-# the generated value moves smoothly between:
-#
-#     10 and 90
-#
-# These three settings can also be changed remotely through SCADALGERIA
-# commands.
-# =====================================================================
-
-SEND_EVERY_SECONDS = 1.0
-
-sine_period = 300.0
-sine_center = 50.0
-sine_amplitude = 40.0
-
-
-# =====================================================================
-# STEP 4 OF 9 — MQTT IDENTITY AND TOPICS
-#
-# SCADALGERIA derives the MQTT identity from:
-#
-#     tenant
-#     API key
-#     source
-#
-# The source ID is Base64URL encoded in the MQTT username.
-#
-# The external tool uses five MQTT topics:
-#
-#     auth/challenge
-#         SCADALGERIA -> client authentication challenge
-#
-#     auth/response
-#         client -> SCADALGERIA authentication proof
-#
-#     tags
-#         client -> SCADALGERIA telemetry
-#
-#     commands
-#         SCADALGERIA -> client commands
-#
-#     commands/result
-#         client -> SCADALGERIA command execution result
-# =====================================================================
-
-CLIENT_ID = f"{SOURCE_ID}-{uuid.uuid4().hex[:8]}"
-
-encoded_source = base64.urlsafe_b64encode(
-    SOURCE_ID.encode("utf-8")
-).decode("ascii").rstrip("=")
-
-MQTT_USERNAME = (
-    f"v1/"
-    f"{TENANT_ID}/"
-    f"{API_KEY_ID}/"
-    f"{encoded_source}"
+CONNECTION_CONFIG_FILE = Path(
+    os.getenv(
+        "SCADALGERIA_CONFIG_FILE",
+        "scadalgeria-connection.json",
+    )
 )
 
-AUTH_CHALLENGE_TOPIC = (
-    f"scada/{TENANT_ID}/{API_KEY_ID}/"
-    f"{CLIENT_ID}/auth/challenge"
-)
-
-AUTH_RESPONSE_TOPIC = (
-    f"scada/{TENANT_ID}/{API_KEY_ID}/"
-    f"{CLIENT_ID}/auth/response"
-)
-
-TELEMETRY_TOPIC = (
-    f"scada/{TENANT_ID}/{PROJECT_ID}/"
-    f"{SOURCE_ID}/tags"
-)
-
-COMMAND_TOPIC = (
-    f"scada/{TENANT_ID}/{PROJECT_ID}/"
-    f"{SOURCE_ID}/commands"
-)
-
-COMMAND_RESULT_TOPIC = (
-    f"scada/{TENANT_ID}/{PROJECT_ID}/"
-    f"{SOURCE_ID}/commands/result"
-)
+INPUT_TAG_ADDRESS = "di.input1"
+OUTPUT_TAG_ADDRESS = "do.output1"
 
 
-# Session encryption key.
-# It becomes available after authentication.
-session_key = None
-
-# Used to make each AES-GCM nonce unique inside this MQTT session.
-nonce_counter = 0
-
-# Last outgoing SCADALGERIA replay sequence.
-last_sequence = 0
+def required_secret(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required secret: {name}")
+    return value
 
 
-# =====================================================================
-# STEP 5 OF 9 — AUTHENTICATION
+def require_mapping(value, field_name: str) -> dict:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Copied configuration field '{field_name}' must be an object")
+    return value
+
+
+def require_string(mapping: dict, field_name: str) -> str:
+    value = mapping.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"Copied configuration field '{field_name}' is missing or invalid")
+    return value
+
+
+def require_boolean_tag(manifest: dict, address: str, direction: str) -> None:
+    matches = [
+        tag for tag in manifest.get("tags", [])
+        if isinstance(tag, dict) and tag.get("address") == address
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(f"Copied configuration must contain exactly one tag '{address}'")
+    tag = matches[0]
+    if tag.get("dataType") != "Boolean" or tag.get("direction") != direction:
+        raise RuntimeError(
+            f"Tag '{address}' must be Boolean/{direction} for this digital I/O example"
+        )
+
+
+def resolve_client_topic(template: str, client_id: str) -> str:
+    if template.count("{clientId}") != 1:
+        raise RuntimeError("Authentication topic template must contain exactly one {clientId}")
+    return template.replace("{clientId}", client_id)
+
+
+def create_unique_client_id() -> str:
+    # One generated ID per running client instance. It may be reused by that
+    # instance during reconnects, but must not be shared by concurrent clients.
+    return "scada-" + secrets.token_hex(8)
+
+
+def load_connection_configuration() -> dict:
+    manifest = json.loads(CONNECTION_CONFIG_FILE.read_text(encoding="utf-8"))
+
+    if manifest.get("schema") != "scadalgeria.direct-firmware.connection":
+        raise RuntimeError("Unsupported SCADALGERIA connection configuration schema")
+    if manifest.get("schemaVersion") != 1:
+        raise RuntimeError("This example supports connection configuration schemaVersion 1")
+
+    connection = require_mapping(manifest.get("connection"), "connection")
+    identity = require_mapping(manifest.get("identity"), "identity")
+    mqtt_config = require_mapping(manifest.get("mqtt"), "mqtt")
+    broker = require_mapping(mqtt_config.get("broker"), "mqtt.broker")
+    topics = require_mapping(mqtt_config.get("topics"), "mqtt.topics")
+    qos = require_mapping(mqtt_config.get("qos"), "mqtt.qos")
+    authentication = require_mapping(manifest.get("authentication"), "authentication")
+    encryption = require_mapping(manifest.get("encryption"), "encryption")
+    session_kdf = require_mapping(
+        encryption.get("sessionKeyDerivation"),
+        "encryption.sessionKeyDerivation",
+    )
+    secrets_contract = require_mapping(manifest.get("secrets"), "secrets")
+
+    if connection.get("enabled") is not True:
+        raise RuntimeError("The copied Connection is disabled")
+    if mqtt_config.get("protocol") != "3.1.1" or mqtt_config.get("cleanSession") is not True:
+        raise RuntimeError("This example requires MQTT 3.1.1 with cleanSession=true")
+    if broker.get("transport") != "tcp":
+        raise RuntimeError("This example supports the copied TCP MQTT transport")
+    if mqtt_config.get("clientIdRequirement") != "unique-per-active-session":
+        raise RuntimeError("Unsupported clientIdRequirement in copied configuration")
+    if any(qos.get(name) != 1 for name in ("telemetry", "commands", "commandResults")):
+        raise RuntimeError("This example requires copied telemetry/command/result QoS values of 1")
+    if authentication.get("scheme") != "HMAC-SHA256":
+        raise RuntimeError("Unsupported authentication scheme")
+    if encryption.get("scheme") != "AES-256-GCM":
+        raise RuntimeError("Unsupported encryption scheme")
+    if session_kdf.get("algorithm") != "HKDF-SHA256" or session_kdf.get("info") != "SCADA-ENC-v1":
+        raise RuntimeError("Unsupported session-key derivation contract")
+    if secrets_contract.get("apiKeySecretIncluded") is not False:
+        raise RuntimeError("Connection Copy JSON must never contain the API-key secret")
+
+    require_boolean_tag(manifest, INPUT_TAG_ADDRESS, "Input")
+    require_boolean_tag(manifest, OUTPUT_TAG_ADDRESS, "Output")
+
+    client_id = create_unique_client_id()
+
+    return {
+        "host": require_string(broker, "host"),
+        "port": int(broker.get("port")),
+        "client_id": client_id,
+        "mqtt_username": require_string(mqtt_config, "username"),
+        "key_id": require_string(identity, "keyId"),
+        "auth_challenge_topic": resolve_client_topic(
+            require_string(topics, "authenticationChallenge"), client_id
+        ),
+        "auth_response_topic": resolve_client_topic(
+            require_string(topics, "authenticationResponse"), client_id
+        ),
+        "telemetry_topic": require_string(topics, "telemetry"),
+        "commands_topic": require_string(topics, "commands"),
+        "command_result_topic": require_string(topics, "commandResults"),
+    }
+
+
+configuration = load_connection_configuration()
+
+MQTT_HOST = configuration["host"]
+MQTT_PORT = configuration["port"]
+CLIENT_ID = configuration["client_id"]
+MQTT_USERNAME = configuration["mqtt_username"]
+API_KEY_ID = configuration["key_id"]
+API_KEY_TOKEN = required_secret("SCADALGERIA_API_KEY")
+AUTH_CHALLENGE_TOPIC = configuration["auth_challenge_topic"]
+AUTH_RESPONSE_TOPIC = configuration["auth_response_topic"]
+TELEMETRY_TOPIC = configuration["telemetry_topic"]
+COMMAND_TOPIC = configuration["commands_topic"]
+COMMAND_RESULT_TOPIC = configuration["command_result_topic"]
+
+
+# ============================================================================
 #
-# SCADALGERIA does NOT use the API key secret as an MQTT password.
+# STEP 3 OF 9 — LOCAL DIGITAL I/O
 #
-# Authentication works like this:
+# Raspberry Pi 5 uses the Linux GPIO character-device interface.
+# Verify the correct gpiochip with `gpioinfo` on the target image.
 #
-#     connect
-#         ↓
-#     receive server nonce
-#         ↓
-#     generate client nonce
-#         ↓
-#     HMAC-SHA256 proof
-#         ↓
-#     send auth response
-#         ↓
-#     derive AES session key with HKDF-SHA256
+# This example uses:
 #
-# After authentication, the same session key protects telemetry,
-# commands and command results.
-# =====================================================================
+#   BCM17 -> input with internal pull-up
+#            switch asserted when connected to GND
+#
+#   BCM27 -> output
+#            drive only a safe logic input or properly current-limited LED
+#
+# The local helper methods deliberately return/write 0 or 1 because that is
+# also the command value accepted by this example's "do.output1" contract.
+# ============================================================================
+
+GPIO_CHIP = os.getenv(
+    "SCADALGERIA_GPIO_CHIP",
+    "/dev/gpiochip0",
+)
+
+INPUT_GPIO = 17
+OUTPUT_GPIO = 27
 
 
-def on_connect(client, userdata, flags, reason_code, properties):
-    if reason_code.is_failure:
-        print("MQTT connection failed:", reason_code)
-        return
+gpio_request = gpiod.request_lines(
+    GPIO_CHIP,
+    consumer="scadalgeria-example",
+    config={
+        INPUT_GPIO: gpiod.LineSettings(
+            direction=Direction.INPUT,
+            bias=Bias.PULL_UP,
+        ),
+        OUTPUT_GPIO: gpiod.LineSettings(
+            direction=Direction.OUTPUT,
+            output_value=Value.INACTIVE,
+        ),
+    },
+)
 
-    print("Connected to SCADALGERIA")
 
-    # Before authentication, this is the only subscription SCADALGERIA permits.
-    client.subscribe(
-        AUTH_CHALLENGE_TOPIC,
-        qos=1
+def read_digital_input() -> int:
+    """Return 1 when the active-low switch is asserted, otherwise 0."""
+
+    line_value = gpio_request.get_value(INPUT_GPIO)
+
+    return 1 if line_value == Value.INACTIVE else 0
+
+
+def write_digital_output(value: int) -> None:
+    """Apply one validated set-state command to BCM27."""
+
+    gpio_value = (
+        Value.ACTIVE
+        if value == 1
+        else Value.INACTIVE
+    )
+
+    gpio_request.set_value(
+        OUTPUT_GPIO,
+        gpio_value,
     )
 
 
-def authenticate(client, payload):
+# ============================================================================
+# STEP 4 OF 9 — DURABLE DEVICE STATE
+#
+# SCADALGERIA uses the outgoing envelope Seq as replay/order state.
+# It must NOT reset when MQTT reconnects or when this process restarts.
+#
+# The example persists the incremented value BEFORE using it. A crash may
+# therefore skip a sequence number, which is safe. Reusing a number is not.
+#
+# Command results are also cached by CommandDto.Id. MQTT QoS 1 and the command
+# pipeline are at-least-once, so the same command can be delivered again.
+# A cached final result lets the client answer normal redelivery without
+# applying the same set-state output twice.
+# ============================================================================
+
+STATE_FILE = Path(".scadalgeria-state.json")
+MAX_CACHED_COMMAND_RESULTS = 64
+
+
+def load_device_state() -> dict:
+    try:
+        return json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
+        )
+    except FileNotFoundError:
+        return {
+            "seq": 0,
+            "results": {},
+        }
+
+
+device_state = load_device_state()
+
+
+def save_device_state() -> None:
+    temporary_file = STATE_FILE.with_suffix(".tmp")
+
+    temporary_file.write_text(
+        json.dumps(
+            device_state,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    os.replace(
+        temporary_file,
+        STATE_FILE,
+    )
+
+
+def reserve_next_sequence() -> int:
+    device_state["seq"] += 1
+
+    save_device_state()
+
+    return device_state["seq"]
+
+
+def get_cached_command_result(command_id: str):
+    return device_state["results"].get(command_id)
+
+
+def remember_command_result(
+    command_id: str,
+    result: list,
+) -> None:
+    results = device_state["results"]
+
+    results[command_id] = result
+
+    # This bounded cache is suitable for a public example. A production
+    # device can use a durable journal appropriate for its command semantics.
+    while len(results) > MAX_CACHED_COMMAND_RESULTS:
+        oldest_command_id = next(iter(results))
+        results.pop(oldest_command_id)
+
+    save_device_state()
+
+
+# ============================================================================
+# STEP 5 OF 9 — AUTHENTICATION CRYPTOGRAPHY AND SESSION STATE
+#
+# CONNECT success is not yet device authentication.
+#
+# The authentication flow is:
+#
+#   MQTT CONNECT
+#       ↓
+#   subscribe ONLY to authChallenge
+#       ↓
+#   receive [ServerNonce, ExpiresAtUnixMs]
+#       ↓
+#   create ClientNonce
+#       ↓
+#   HMAC-SHA256(ServerNonce || ClientNonce || UTF8(ClientId))
+#       ↓
+#   publish [ClientNonce, Auth]
+#       ↓
+#   derive AES session key using HKDF-SHA256
+#       ↓
+#   subscribe to the exact commands topic
+#       ↓
+#   successful post-auth SUBACK proves promotion
+#
+# Every MQTT reconnect repeats this flow and derives a NEW session key.
+# ============================================================================
+
+session_key: bytes | None = None
+session_key_lock = threading.RLock()
+
+authenticated = threading.Event()
+challenge_subscription_message_id: int | None = None
+command_subscription_message_id: int | None = None
+
+
+def set_session_key(value: bytes) -> None:
     global session_key
 
-    # MqttAuthChallengeDto:
-    #
-    # [0] ServerNonce
-    # [1] ExpiresAtUnixMs
+    with session_key_lock:
+        session_key = bytes(value)
 
-    challenge = msgpack.unpackb(
+
+def clear_authenticated_session() -> None:
+    global session_key
+
+    with session_key_lock:
+        session_key = None
+
+    authenticated.clear()
+
+
+def require_session_key() -> bytes:
+    with session_key_lock:
+        if session_key is None:
+            raise RuntimeError(
+                "SCADALGERIA MQTT session is not authenticated"
+            )
+
+        return bytes(session_key)
+
+
+def current_unix_milliseconds() -> int:
+    return time.time_ns() // 1_000_000
+
+
+def pack_messagepack(value) -> bytes:
+    return msgpack.packb(
+        value,
+        use_bin_type=True,
+    )
+
+
+def unpack_messagepack(payload: bytes):
+    return msgpack.unpackb(
         payload,
-        raw=False
+        raw=False,
+        timestamp=3,
     )
 
-    server_nonce = challenge[0]
-    expires_at = challenge[1]
 
-    if int(time.time() * 1000) > expires_at:
-        raise RuntimeError("Authentication challenge expired")
+def require_non_negative_integer(value) -> int:
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    ):
+        return value
 
-    client_nonce = os.urandom(16)
-
-    secret = API_KEY_SECRET.encode("utf-8")
-
-    # HMAC input:
-    #
-    # serverNonce || clientNonce || clientId
-
-    proof = hmac.new(
-        secret,
-        server_nonce
-        + client_nonce
-        + CLIENT_ID.encode("utf-8"),
-        hashlib.sha256
-    ).digest()
-
-    # MqttAuthResponseDto:
-    #
-    # [0] ClientNonce
-    # [1] Auth
-
-    response = msgpack.packb(
-        [
-            client_nonce,
-            proof
-        ],
-        use_bin_type=True
+    raise ValueError(
+        "Expected a non-negative integer"
     )
 
-    result = client.publish(
-        AUTH_RESPONSE_TOPIC,
-        response,
-        qos=1
-    )
 
-    result.wait_for_publish()
+def derive_session_key(
+    server_nonce: bytes,
+    client_nonce: bytes,
+) -> bytes:
+    """Implement the current SCADA-ENC-v1 HKDF contract."""
 
-    # Derive the AES-256 session key.
+    token_bytes = API_KEY_TOKEN.encode("utf-8")
 
-    session_key = HKDF(
+    return HKDF(
         algorithm=hashes.SHA256(),
         length=32,
         salt=server_nonce + client_nonce,
-        info=b"SCADA-ENC-v1"
-    ).derive(secret)
+        info=b"SCADA-ENC-v1",
+    ).derive(token_bytes)
 
-    # Authentication processing occurs before SCADALGERIA acknowledges
-    # the QoS-1 authentication publish. We can now subscribe to commands.
 
-    client.subscribe(
-        COMMAND_TOPIC,
-        qos=1
+def build_authentication_proof(
+    server_nonce: bytes,
+    client_nonce: bytes,
+) -> bytes:
+    """Build the HMAC proof expected by platform."""
+
+    proof_message = (
+        server_nonce
+        + client_nonce
+        + CLIENT_ID.encode("utf-8")
     )
 
-    print("Authenticated with SCADALGERIA")
-    print("Subscribed to SCADALGERIA commands")
+    return hmac.new(
+        API_KEY_TOKEN.encode("utf-8"),
+        proof_message,
+        hashlib.sha256,
+    ).digest()
 
 
-# =====================================================================
-# STEP 6 OF 9 — TELEMETRY
-#
-# This block converts a normal Python number into the SCADALGERIA MQTT
-# telemetry format.
-#
-# The inner MessagePack payload is:
-#
-#     TagFrameBatchDto
-#         ↓
-#     AES-256-GCM encryption
-#         ↓
-#     AesGcmEnvelopeDto
-#         ↓
-#     MQTT publish
-#
-# The function send_value() is deliberately simple from the caller's
-# perspective:
-#
-#     send_value(client, 42.5)
-# =====================================================================
+def authenticate_with_scadalgeria(
+    client: mqtt.Client,
+    challenge_payload: bytes,
+) -> None:
+    global command_subscription_message_id
 
-
-def next_sequence():
-    global last_sequence
-
-    # Use Unix milliseconds as the baseline so a normal process restart
-    # does not restart the replay sequence from zero.
-
-    current = int(time.time() * 1000)
-
-    last_sequence = max(
-        current,
-        last_sequence + 1
+    challenge = unpack_messagepack(
+        challenge_payload
     )
 
-    return last_sequence
-
-
-def next_nonce():
-    global nonce_counter
-
-    nonce_counter += 1
-
-    return nonce_counter.to_bytes(
-        12,
-        byteorder="big"
-    )
-
-
-def encrypt_payload(plaintext):
-    sequence = next_sequence()
-    timestamp_ms = int(time.time() * 1000)
-
-    nonce = next_nonce()
-
-    # SCADALGERIA AES-GCM AAD:
+    # MqttAuthChallengeDto:
     #
-    # Seq      -> uint64 big-endian
-    # TsUnixMs -> uint64 big-endian
+    #   [0] ServerNonce       byte[16]
+    #   [1] ExpiresAtUnixMs   int64
+    if (
+        not isinstance(challenge, list)
+        or len(challenge) != 2
+    ):
+        raise ValueError(
+            "Malformed SCADALGERIA authentication challenge"
+        )
 
-    aad = struct.pack(
+    server_nonce = challenge[0]
+    expires_at_unix_ms = require_non_negative_integer(
+        challenge[1]
+    )
+
+    if (
+        not isinstance(server_nonce, bytes)
+        or len(server_nonce) != 16
+    ):
+        raise ValueError(
+            "Authentication ServerNonce must be 16 bytes"
+        )
+
+    if current_unix_milliseconds() >= expires_at_unix_ms:
+        raise ValueError(
+            "SCADALGERIA authentication challenge expired"
+        )
+
+    client_nonce = os.urandom(16)
+
+    authentication_proof = build_authentication_proof(
+        server_nonce,
+        client_nonce,
+    )
+
+    new_session_key = derive_session_key(
+        server_nonce,
+        client_nonce,
+    )
+
+    # MqttAuthResponseDto:
+    #
+    #   [0] ClientNonce   byte[16]
+    #   [1] Auth          byte[32]
+    auth_response = pack_messagepack(
+        [
+            client_nonce,
+            authentication_proof,
+        ]
+    )
+
+    set_session_key(
+        new_session_key
+    )
+
+    publish_info = client.publish(
+        AUTH_RESPONSE_TOPIC,
+        auth_response,
+        qos=1,
+        retain=False,
+    )
+
+    if publish_info.rc != mqtt.MQTT_ERR_SUCCESS:
+        clear_authenticated_session()
+
+        raise RuntimeError(
+            f"Authentication response publish failed locally: {publish_info.rc}"
+        )
+
+    # There is no separate custom AUTH_OK packet. Asking platform for the exact
+    # post-auth command subscription provides a concrete promotion check.
+    subscribe_result, command_subscription_message_id = client.subscribe(
+        COMMAND_TOPIC,
+        qos=1,
+    )
+
+    if subscribe_result != mqtt.MQTT_ERR_SUCCESS:
+        clear_authenticated_session()
+
+        raise RuntimeError(
+            "Command subscription request failed locally"
+        )
+
+
+# ============================================================================
+# STEP 6 OF 9 — MESSAGEPACK DTOs AND AES-256-GCM ENVELOPE
+#
+# Telemetry, commands, and command results use the same envelope shape:
+#
+#   AesGcmEnvelopeDto = [
+#       KeyId,
+#       Nonce,          # 12 random bytes
+#       Ciphertext,
+#       GcmTag,         # 16 bytes
+#       Seq,
+#       TsUnixMs,
+#   ]
+#
+# AES-GCM AAD is exactly:
+#
+#   UInt64BE(Seq) || UInt64BE(TsUnixMs)
+#
+# Nonce and Seq solve different problems:
+#
+#   Nonce -> cryptographic uniqueness for AES-GCM in this session
+#   Seq   -> durable device→platform replay/order identity
+#
+# Never reuse a (session key, nonce) pair. The SCADALGERIA Direct Firmware protocol
+# uses a fresh cryptographically random 12-byte nonce for every envelope.
+# ============================================================================
+
+
+def build_envelope_aad(
+    sequence: int,
+    timestamp_ms: int,
+) -> bytes:
+    return struct.pack(
         ">QQ",
         sequence,
-        timestamp_ms
+        timestamp_ms,
     )
 
-    encrypted = AESGCM(
-        session_key
+
+def encrypt_scadalgeria_payload(
+    inner_message: list,
+) -> bytes:
+    encryption_key = require_session_key()
+
+    sequence = reserve_next_sequence()
+    timestamp_ms = current_unix_milliseconds()
+    nonce = os.urandom(12)
+
+    aad = build_envelope_aad(
+        sequence,
+        timestamp_ms,
+    )
+
+    plaintext = pack_messagepack(
+        inner_message
+    )
+
+    ciphertext_and_tag = AESGCM(
+        encryption_key
     ).encrypt(
         nonce,
         plaintext,
-        aad
+        aad,
     )
 
-    ciphertext = encrypted[:-16]
-    gcm_tag = encrypted[-16:]
-
-    # AesGcmEnvelopeDto:
-    #
-    # [0] KeyId
-    # [1] Nonce
-    # [2] Ciphertext
-    # [3] GcmTag
-    # [4] Seq
-    # [5] TsUnixMs
+    ciphertext = ciphertext_and_tag[:-16]
+    gcm_tag = ciphertext_and_tag[-16:]
 
     envelope = [
         API_KEY_ID,
@@ -423,412 +655,562 @@ def encrypt_payload(plaintext):
         ciphertext,
         gcm_tag,
         sequence,
-        timestamp_ms
+        timestamp_ms,
     ]
 
-    return msgpack.packb(
-        envelope,
-        use_bin_type=True
+    return pack_messagepack(
+        envelope
     )
 
 
-def send_value(client, value):
+def decrypt_scadalgeria_payload(
+    envelope_payload: bytes,
+):
+    encryption_key = require_session_key()
 
-    # TagFrameDto:
-    #
-    # [0] Address
-    # [1] ValNum
-    # [2] ValStr
-    # [3] TsUnixMs
-    # [4] Quality
-    #
-    # Quality 192 = Good.
-
-    frame = [
-        TAG_ADDRESS,
-        float(value),
-        None,
-        0,
-        192
-    ]
-
-    # TagFrameBatchDto:
-    #
-    # [0] Frames
-    # [1] TraceId
-    # [2] SchemaVersion
-
-    batch = [
-        [frame],
-        None,
-        1
-    ]
-
-    plaintext = msgpack.packb(
-        batch,
-        use_bin_type=True
+    envelope = unpack_messagepack(
+        envelope_payload
     )
 
-    payload = encrypt_payload(
-        plaintext
-    )
-
-    client.publish(
-        TELEMETRY_TOPIC,
-        payload,
-        qos=1
-    )
-
-    print(f"SCADALGERIA telemetry: {value:.2f}")
-
-
-# =====================================================================
-# STEP 7 OF 9 — RECEIVE AND DECRYPT COMMANDS
-#
-# SCADALGERIA sends commands to:
-#
-#     scada/{tenant}/{project}/{source}/commands
-#
-# Commands use the same AES-256-GCM session encryption.
-#
-# After decryption, CommandDto is a MessagePack array:
-#
-#     [0] Id
-#     [1] TagAddress
-#     [2] Value
-#     [3] Timestamp
-#     [4] Expiry
-#     [5] LeasedUntil
-#     [6] TraceId
-#     [7] RequiresConfirmation
-#     [8] Confirmed
-#     [9] SchemaVersion
-# =====================================================================
-
-
-def decrypt_payload(payload):
-
-    envelope = msgpack.unpackb(
-        payload,
-        raw=False
-    )
+    if (
+        not isinstance(envelope, list)
+        or len(envelope) != 6
+    ):
+        raise ValueError(
+            "Malformed SCADALGERIA encrypted envelope"
+        )
 
     key_id = envelope[0]
     nonce = envelope[1]
     ciphertext = envelope[2]
     gcm_tag = envelope[3]
-    sequence = envelope[4]
-    timestamp_ms = envelope[5]
+    sequence = require_non_negative_integer(envelope[4])
+    timestamp_ms = require_non_negative_integer(envelope[5])
 
-    if key_id.lower() != API_KEY_ID.lower():
-        raise RuntimeError(
-            "SCADALGERIA command was encrypted for another API key"
+    if key_id != API_KEY_ID:
+        raise ValueError(
+            "Encrypted envelope KeyId does not match this device credential"
         )
 
-    aad = struct.pack(
-        ">QQ",
+    if (
+        not isinstance(nonce, bytes)
+        or len(nonce) != 12
+    ):
+        raise ValueError(
+            "Encrypted envelope nonce must be 12 bytes"
+        )
+
+    if not isinstance(ciphertext, bytes):
+        raise ValueError(
+            "Encrypted envelope ciphertext must be binary"
+        )
+
+    if (
+        not isinstance(gcm_tag, bytes)
+        or len(gcm_tag) != 16
+    ):
+        raise ValueError(
+            "Encrypted envelope GCM tag must be 16 bytes"
+        )
+
+    aad = build_envelope_aad(
         sequence,
-        timestamp_ms
+        timestamp_ms,
     )
 
-    return AESGCM(
-        session_key
+    plaintext = AESGCM(
+        encryption_key
     ).decrypt(
         nonce,
         ciphertext + gcm_tag,
-        aad
+        aad,
     )
 
-
-def receive_command(payload):
-
-    plaintext = decrypt_payload(
-        payload
-    )
-
-    command = msgpack.unpackb(
-        plaintext,
-        raw=False,
-        timestamp=3
-    )
-
-    return command
-
-
-# =====================================================================
-# STEP 8 OF 9 — EXECUTE COMMAND AND SEND RESULT
-#
-# For this demonstration, SCADALGERIA can control the sine generator
-# using three TagAddress values:
-#
-#     sine.amplitude
-#     sine.center
-#     sine.period
-#
-# Examples:
-#
-#     sine.amplitude = 20
-#     sine.center    = 60
-#     sine.period    = 120
-#
-# The external application executes the requested change and publishes
-# CommandResultDto back to SCADALGERIA through:
-#
-#     commands/result
-#
-# This demonstrates the complete SCADALGERIA command lifecycle without
-# controlling any real machinery.
-# =====================================================================
-
-
-def send_command_result(
-    client,
-    command_id,
-    success,
-    error=None
-):
-    # CommandResultDto:
-    #
-    # [0] CommandId
-    # [1] Success
-    # [2] ErrorMessage
-    # [3] Data
-    # [4] SchemaVersion
-
-    result = [
-        command_id,
-        success,
-        error,
-        None,
-        1
-    ]
-
-    plaintext = msgpack.packb(
-        result,
-        use_bin_type=True
-    )
-
-    encrypted = encrypt_payload(
+    return unpack_messagepack(
         plaintext
     )
 
-    client.publish(
-        COMMAND_RESULT_TOPIC,
-        encrypted,
-        qos=1
+
+def publish_encrypted_message(
+    client: mqtt.Client,
+    topic: str,
+    inner_message: list,
+) -> None:
+    encrypted_payload = encrypt_scadalgeria_payload(
+        inner_message
+    )
+
+    publish_info = client.publish(
+        topic,
+        encrypted_payload,
+        qos=1,
+        retain=False,
+    )
+
+    if publish_info.rc != mqtt.MQTT_ERR_SUCCESS:
+        raise RuntimeError(
+            f"MQTT publish failed locally: {publish_info.rc}"
+        )
+
+
+# ============================================================================
+# STEP 7 OF 9 — MQTT HELPERS, AUTHENTICATION, AND TELEMETRY
+#
+# TagFrameDto:
+#
+#   [0] Address
+#   [1] ValNum
+#   [2] ValStr
+#   [3] TsUnixMs
+#   [4] Quality
+#
+# This example sends a numeric 0.0 or 1.0 with Good quality (192).
+# TsUnixMs=0 inside the frame asks the Direct Firmware path to stamp capture
+# time after decrypt. The OUTER encrypted envelope timestamp remains current.
+#
+# TagFrameBatchDto:
+#
+#   [0] Frames
+#   [1] TraceId
+#   [2] SchemaVersion = 1
+# ============================================================================
+
+
+def publish_digital_input_telemetry(
+    client: mqtt.Client,
+) -> None:
+    input_value = read_digital_input()
+
+    tag_frame = [
+        INPUT_TAG_ADDRESS,
+        float(input_value),
+        None,
+        0,
+        192,
+    ]
+
+    tag_frame_batch = [
+        [tag_frame],
+        None,
+        1,
+    ]
+
+    publish_encrypted_message(
+        client,
+        TELEMETRY_TOPIC,
+        tag_frame_batch,
+    )
+
+    print(
+        f"Telemetry sent: {INPUT_TAG_ADDRESS}={input_value}"
     )
 
 
-def execute_command(client, command):
-    global sine_amplitude
-    global sine_center
-    global sine_period
+# ============================================================================
+# STEP 8 OF 9 — COMMAND VALIDATION, LOCAL ACTUATION, AND COMMAND RESULT
+#
+# CommandDto is a MessagePack positional array:
+#
+#   [0] Id
+#   [1] TagAddress
+#   [2] Value
+#   [3] Timestamp
+#   [4] ExpiryEpochSeconds
+#   [5] LeasedUntil
+#   [6] TraceId
+#   [7] RequiresConfirmation
+#   [8] Confirmed
+#   [9] SchemaVersion = 2
+#
+# This snippet accepts only "do.output1" and only values 0/1.
+# It rejects expired commands and honors the operator-confirmation requirement.
+#
+# CommandResultDto:
+#
+#   [0] CommandId
+#   [1] Success
+#   [2] ErrorMessage
+#   [3] Data
+#   [4] SchemaVersion = 1
+# ============================================================================
+
+
+def parse_output_bit(value) -> int:
+    if value is True:
+        return 1
+
+    if value is False:
+        return 0
+
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value in (0, 1)
+    ):
+        return int(value)
+
+    raise ValueError(
+        "do.output1 accepts only 0 or 1"
+    )
+
+
+def execute_output_command(
+    command: list,
+) -> list:
+    if len(command) != 10:
+        raise ValueError(
+            "CommandDto must contain exactly 10 fields"
+        )
 
     command_id = command[0]
-    address = command[1]
-    value = command[2]
+    tag_address = command[1]
+    command_value = command[2]
 
-    expiry = command[4]
+    expiry_epoch_seconds = require_non_negative_integer(
+        command[4]
+    )
+
     requires_confirmation = command[7]
     confirmed = command[8]
 
+    schema_version = require_non_negative_integer(
+        command[9]
+    )
+
+    if (
+        not isinstance(command_id, str)
+        or not command_id
+    ):
+        raise ValueError(
+            "Command Id must be a non-empty string"
+        )
+
+    if not isinstance(tag_address, str):
+        raise ValueError(
+            "Command TagAddress must be a string"
+        )
+
+    if (
+        not isinstance(requires_confirmation, bool)
+        or not isinstance(confirmed, bool)
+    ):
+        raise ValueError(
+            "Command confirmation fields must be booleans"
+        )
+
+    if schema_version != 2:
+        raise ValueError(
+            f"Unsupported CommandDto schema version: {schema_version}"
+        )
+
+    if tag_address != OUTPUT_TAG_ADDRESS:
+        raise ValueError(
+            f"Unsupported command address: {tag_address}"
+        )
+
+    if expiry_epoch_seconds <= int(time.time()):
+        raise ValueError(
+            "Command expired"
+        )
+
+    if requires_confirmation and not confirmed:
+        raise ValueError(
+            "Command requires operator confirmation"
+        )
+
+    output_value = parse_output_bit(
+        command_value
+    )
+
+    write_digital_output(
+        output_value
+    )
+
+    print(
+        f"Command applied: {OUTPUT_TAG_ADDRESS}={output_value}"
+    )
+
+    return [
+        command_id,
+        True,
+        None,
+        json.dumps(
+            {"appliedValue": output_value}
+        ),
+        1,
+    ]
+
+
+def handle_scadalgeria_command(
+    client: mqtt.Client,
+    encrypted_payload: bytes,
+) -> None:
+    command = decrypt_scadalgeria_payload(
+        encrypted_payload
+    )
+
+    if not isinstance(command, list):
+        raise ValueError(
+            "Decrypted command payload is not a MessagePack array"
+        )
+
+    if (
+        not command
+        or not isinstance(command[0], str)
+        or not command[0]
+    ):
+        # Without a real CommandId there is nothing useful to correlate back
+        # to the platform. Fail closed rather than inventing an identifier.
+        raise ValueError(
+            "Malformed command does not contain a valid CommandId"
+        )
+
+    command_id = command[0]
+
+    cached_result = get_cached_command_result(
+        command_id
+    )
+
+    if cached_result is not None:
+        print(
+            f"Command redelivery detected: {command_id}; returning cached result"
+        )
+
+        publish_encrypted_message(
+            client,
+            COMMAND_RESULT_TOPIC,
+            cached_result,
+        )
+
+        return
+
     try:
-
-        # Reject an expired SCADALGERIA command.
-
-        if int(time.time()) > expiry:
-            raise ValueError(
-                "Command expired"
-            )
-
-        # Respect the SCADALGERIA operator-confirmation boundary.
-
-        if requires_confirmation and not confirmed:
-            raise ValueError(
-                "Command requires confirmation"
-            )
-
-        # Minimal demo commands.
-
-        if address == "sine.amplitude":
-            sine_amplitude = float(value)
-
-        elif address == "sine.center":
-            sine_center = float(value)
-
-        elif address == "sine.period":
-            period = float(value)
-
-            if period <= 0:
-                raise ValueError(
-                    "Period must be greater than zero"
-                )
-
-            sine_period = period
-
-        else:
-            raise ValueError(
-                f"Unsupported SCADALGERIA command: {address}"
-            )
-
-        print(
-            f"SCADALGERIA command executed: "
-            f"{address} = {value}"
+        command_result = execute_output_command(
+            command
         )
-
-        send_command_result(
-            client,
-            command_id,
-            True
-        )
-
     except Exception as error:
-
-        print(
-            f"SCADALGERIA command failed: {error}"
-        )
-
-        send_command_result(
-            client,
+        command_result = [
             command_id,
             False,
-            str(error)
+            str(error)[:256],
+            None,
+            1,
+        ]
+
+        print(
+            f"Command rejected: {error}"
+        )
+
+    # Persist the final result before publishing it to the platform.
+    remember_command_result(
+        command_id,
+        command_result,
+    )
+
+    publish_encrypted_message(
+        client,
+        COMMAND_RESULT_TOPIC,
+        command_result,
+    )
+
+
+# ============================================================================
+# STEP 9 OF 9 — MQTT 3.1.1 LIFECYCLE, RECONNECT, AND MAIN LOOP
+#
+# Important reconnect rule:
+#
+#   MQTT reconnect != reuse the old authenticated session.
+#
+# On every reconnect we clear the old AES session key, subscribe only to the
+# challenge topic, and repeat authentication. The durable outgoing Seq and
+# command-result cache do NOT reset.
+#
+# Also note: MQTT PUBACK only proves transport-level progress. platform can still
+# reject telemetry semantically because of tag/type/quality/range/replay/rate
+# rules. Use platform readback/observability when validating an integration.
+# ============================================================================
+
+
+def on_connect(
+    client,
+    _userdata,
+    _flags,
+    reason_code,
+    _properties,
+) -> None:
+    global challenge_subscription_message_id
+    global command_subscription_message_id
+
+    if reason_code.is_failure:
+        print(
+            f"MQTT CONNECT failed: {reason_code}"
+        )
+
+        return
+
+    print(
+        "MQTT connected; waiting for a fresh SCADALGERIA challenge"
+    )
+
+    clear_authenticated_session()
+    challenge_subscription_message_id = None
+    command_subscription_message_id = None
+
+    subscribe_result, challenge_subscription_message_id = client.subscribe(
+        AUTH_CHALLENGE_TOPIC,
+        qos=1,
+    )
+
+    if subscribe_result != mqtt.MQTT_ERR_SUCCESS:
+        raise RuntimeError(
+            "Pre-auth challenge subscription failed locally"
         )
 
 
-# MQTT messages arrive through this callback.
+def on_disconnect(
+    _client,
+    _userdata,
+    _disconnect_flags,
+    reason_code,
+    _properties,
+) -> None:
+    global challenge_subscription_message_id
+    global command_subscription_message_id
 
-def on_message(client, userdata, message):
+    clear_authenticated_session()
+    challenge_subscription_message_id = None
+    command_subscription_message_id = None
 
+    print(
+        f"MQTT disconnected: {reason_code}; next connection must re-authenticate"
+    )
+
+
+def on_subscribe(
+    _client,
+    _userdata,
+    message_id,
+    reason_codes,
+    _properties,
+) -> None:
+    exact_qos1_grant = (
+        len(reason_codes) == 1
+        and not reason_codes[0].is_failure
+        and int(reason_codes[0].value) == 1
+    )
+
+    if message_id == challenge_subscription_message_id:
+        if not exact_qos1_grant:
+            clear_authenticated_session()
+            raise RuntimeError(
+                "The broker did not grant the authentication challenge subscription at QoS 1"
+            )
+
+        print(
+            "Authentication challenge subscription granted at QoS 1"
+        )
+        return
+
+    if message_id != command_subscription_message_id:
+        return
+
+    if not exact_qos1_grant:
+        clear_authenticated_session()
+        raise RuntimeError(
+            "The broker did not grant the exact command subscription at QoS 1"
+        )
+
+    authenticated.set()
+
+    print(
+        "SCADALGERIA session authenticated; telemetry and commands are enabled"
+    )
+
+
+def on_message(
+    client,
+    _userdata,
+    message,
+) -> None:
     try:
-
         if message.topic == AUTH_CHALLENGE_TOPIC:
-
-            authenticate(
+            authenticate_with_scadalgeria(
                 client,
-                message.payload
+                message.payload,
             )
 
-        elif message.topic == COMMAND_TOPIC:
+            return
 
-            command = receive_command(
-                message.payload
-            )
-
-            execute_command(
+        if (
+            message.topic == COMMAND_TOPIC
+            and authenticated.is_set()
+        ):
+            handle_scadalgeria_command(
                 client,
-                command
+                message.payload,
             )
 
     except Exception as error:
+        # Do not print API_KEY_TOKEN, session_key, HMAC input, or plaintext
+        # command material in production diagnostics.
         print(
-            "SCADALGERIA MQTT message error:",
-            error
+            f"SCADALGERIA protocol error: {error}"
         )
 
 
-# =====================================================================
-# STEP 9 OF 9 — MAIN LOOP
-#
-# This is the actual external application.
-#
-# The sequence is:
-#
-#     connect
-#         ↓
-#     authenticate with SCADALGERIA
-#         ↓
-#     subscribe to SCADALGERIA commands
-#         ↓
-#     generate sine value
-#         ↓
-#     send telemetry to SCADALGERIA
-#         ↓
-#     wait one second
-#         ↓
-#     repeat forever
-#
-# MQTT runs in a background thread, so SCADALGERIA commands can arrive
-# and execute while the main loop continues generating telemetry.
-#
-# Using elapsed monotonic time rather than a fixed sample counter keeps
-# the wave tied to real elapsed time.
-# =====================================================================
-
-
-client = mqtt.Client(
+mqtt_client = mqtt.Client(
     callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
     client_id=CLIENT_ID,
+    protocol=mqtt.MQTTv311,
     clean_session=True,
-    protocol=mqtt.MQTTv311
 )
 
-# SCADALGERIA sends only the canonical username during MQTT CONNECT.
-# The API key secret is proven later through the HMAC challenge.
-
-client.username_pw_set(
-    username=MQTT_USERNAME
+mqtt_client.username_pw_set(
+    MQTT_USERNAME,
+    password="",
 )
 
-client.on_connect = on_connect
-client.on_message = on_message
+# Paho's network loop can reconnect after an unexpected disconnect. Backoff
+# prevents a broken device from hammering the MQTT service with a tight reconnect loop.
+mqtt_client.reconnect_delay_set(
+    min_delay=1,
+    max_delay=30,
+)
 
-client.connect(
+mqtt_client.on_connect = on_connect
+mqtt_client.on_disconnect = on_disconnect
+mqtt_client.on_subscribe = on_subscribe
+mqtt_client.on_message = on_message
+
+mqtt_client.connect(
     MQTT_HOST,
     MQTT_PORT,
-    keepalive=30
+    keepalive=60,
 )
 
-client.loop_start()
+mqtt_client.loop_start()
 
-
-# Wait until SCADALGERIA authentication completes.
-
-while session_key is None:
-    time.sleep(0.1)
-
-
-print("Starting SCADALGERIA sine-wave telemetry")
-print(f"Period: {sine_period} seconds")
-print(f"Center: {sine_center}")
-print(f"Amplitude: {sine_amplitude}")
-
-
-start_time = time.monotonic()
-
-
-while True:
-
-    elapsed = (
-        time.monotonic()
-        - start_time
-    )
-
-    # Standard sine function:
-    #
-    # value =
-    #     center
-    #     +
-    #     amplitude * sin(2π × elapsed / period)
-
-    value = (
-        sine_center
-        +
-        sine_amplitude
-        *
-        math.sin(
-            2
-            * math.pi
-            * elapsed
-            / sine_period
+try:
+    if not authenticated.wait(timeout=20):
+        raise TimeoutError(
+            "SCADALGERIA authentication was not promoted within 20 seconds"
         )
-    )
 
-    send_value(
-        client,
-        value
-    )
+    while True:
+        # A reconnect clears this event. Telemetry pauses until the new
+        # challenge/response flow and post-auth subscription complete.
+        if not authenticated.wait(timeout=1.0):
+            continue
 
-    time.sleep(
-        SEND_EVERY_SECONDS
-    )
+        publish_digital_input_telemetry(
+            mqtt_client
+        )
+
+        # One second is only the example cadence. The real client must obey
+        # the telemetryPolicy in the copied connection configuration.
+        time.sleep(1.0)
+
+finally:
+    mqtt_client.disconnect()
+    mqtt_client.loop_stop()
+    gpio_request.release()

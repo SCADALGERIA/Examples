@@ -1,542 +1,346 @@
-# SCADALGERIA Python MQTT Example
+# Python · Raspberry Pi 5 Direct Firmware
 
-This example demonstrates the minimum bidirectional MQTT integration between an external Python application and SCADALGERIA.
+🎯 **Target:** Raspberry Pi 5 · Linux · Python 3.15.2  
+📄 **Companion source:** [`main.py`](main.py)
 
-The application:
+📘 **Start here:** [SCADALGERIA Quick Start](https://github.com/Belalia-Industries/SCADALGERIA-Launch-Site/blob/main/docs/en/quick-start.mdx)
 
-- Connects to SCADALGERIA through MQTT.
-- Authenticates using the SCADALGERIA challenge-response protocol.
-- Generates a continuous sine wave.
-- Sends one telemetry value every second.
-- Receives commands from SCADALGERIA.
-- Executes supported commands.
-- Sends command results back to SCADALGERIA.
+> ℹ️ **Repository naming note:** `External-Applications` examples are software clients using the SCADALGERIA Direct Firmware MQTT protocol. The client authenticates, publishes telemetry, receives commands, and publishes command results over MQTT 3.1.1.
 
-The example is intentionally small so the complete SCADALGERIA communication flow can be understood from a single Python file.
-
----
-
-## Python Version
-
-Recommended:
+## 🚦 What the snippet demonstrates
 
 ```text
-Python 3.11+
+local digital input di.input1
+        ↓
+encrypted MQTT telemetry
+        ↓
+SCADALGERIA platform
+        ↓
+encrypted do.output1 command
+        ↓
+validate + deduplicate + write local digital output
+        ↓
+encrypted command result
 ```
 
-Check the installed version with:
+The file is intentionally a protocol/I-O snippet rather than a complete build project. Build manifests, Wi-Fi provisioning UI, service management, OTA, watchdog policy, and production secret provisioning belong in the surrounding application.
 
-```bash
-python --version
-```
+## 🧩 Source walkthrough
 
----
+Every source file deliberately follows the same nine-stage layout so you can move between languages without relearning the integration structure:
 
-## Required Libraries
+1. **Imports** — runtime, MQTT, MessagePack, cryptography, and GPIO dependencies.
+2. **Connection Copy JSON + API-key secret** — parse the non-secret copied configuration, validate it, generate the active-session ClientId, and load the secret separately.
+3. **Local digital I/O** — read `di.input1` and write `do.output1`.
+4. **Durable device state** — replay `Seq` and command-result deduplication state.
+5. **Authentication cryptography + session state** — challenge proof, HKDF session key, and reconnect invalidation.
+6. **MessagePack DTOs + AES-GCM envelope** — byte-for-byte SCADALGERIA wire helpers.
+7. **MQTT helpers + authentication + telemetry** — challenge promotion and encrypted input publication.
+8. **Command validation + local actuation + result** — decrypt, validate, deduplicate, actuate, and publish the cached result.
+9. **MQTT lifecycle + reconnect** — MQTT 3.1.1 setup, reconnect behavior, re-authentication, and main loop.
 
-Install the required packages with:
+The examples are intentionally **readable rather than code-golfed**. Small helpers and explanatory comments are retained where they make a protocol invariant, safety rule, or recovery rule easier to audit.
 
-```bash
-pip install paho-mqtt msgpack cryptography
-```
+## 🧭 SCADALGERIA Direct Firmware wire contract
 
-The example uses the following libraries:
-
-| Library | Purpose |
+| Item | Required value |
 |---|---|
-| `paho-mqtt` | Connects the external application to the SCADALGERIA MQTT endpoint and publishes/subscribes to MQTT topics. |
-| `msgpack` | Encodes and decodes SCADALGERIA MQTT message structures. |
-| `cryptography` | Provides HKDF-SHA256 and AES-256-GCM for the SCADALGERIA encrypted MQTT session. |
-| Python standard library | Provides timing, sine-wave generation, HMAC-SHA256, identifiers, Base64URL encoding, and binary operations. |
+| Broker | `mqtt.broker.host` from the copied JSON |
+| Port / transport | `mqtt.broker.port` + `mqtt.broker.transport` from the copied JSON |
+| MQTT | **3.1.1** only |
+| Session | `CleanSession=true` |
+| QoS | `1` for auth, telemetry, commands, results |
+| MQTT password | Empty — **never put the API-key token here** |
+| Authentication | HMAC-SHA256 challenge/response |
+| Session key | HKDF-SHA256, info `SCADA-ENC-v1`, 32 bytes |
+| Payload encryption | AES-256-GCM, random 12-byte nonce, 16-byte tag |
+| AAD | `UInt64BE(Seq) || UInt64BE(TsUnixMs)` |
+| Serialization | MessagePack positional arrays matching numeric `[Key(n)]` DTOs |
 
----
+The Direct Firmware MQTT endpoint is plain TCP. AES-GCM protects the application payload, **not** MQTT metadata. For production deployments, restrict TCP 1883 to approved client networks or place the MQTT path inside an approved private tunnel/VPN. Do not assume `8883`/MQTTS is currently available.
 
-## Communication Flow
+### Public provisioning workflow: Copy JSON + separate API key
+
+Start with the **[SCADALGERIA Quick Start](https://github.com/Belalia-Industries/SCADALGERIA-Launch-Site/blob/main/docs/en/quick-start.mdx)**, then provision this example as follows:
+
+1. Create the Direct Firmware Connection and define the two tags used by this example: `di.input1` as a Boolean **Input** and `do.output1` as a Boolean **Output**.
+2. Create one source-bound API key for that Connection. The full bidirectional example needs these scopes:
+
+```json
+{
+  "scopes": [
+    "connections:read",
+    "ingest:write",
+    "commands:read",
+    "commands:ack"
+  ]
+}
+```
+
+3. In the Connection actions, choose **Copy firmware configuration → Copy JSON**.
+4. Save that non-secret JSON unchanged as `scadalgeria-connection.json` (or the target-specific path documented below).
+5. Supply the **full API-key secret separately**. Never add it to the copied JSON, source control, logs, MQTT password, or screenshots. The secret must belong to the API key identified by the copied `identity.keyId`; a secret from another key will not authenticate this manifest.
+
+The copied document is the configuration authority. The examples read these fields directly rather than asking you to manually copy broker/topic/identity constants into source code:
+
+> 🔒 **Configuration privacy:** The copied JSON intentionally contains no API-key secret, but it can contain environment-specific identifiers, tag names, and connection metadata. Do not publish a real production copy. The JSON shown in this repository uses placeholders only.
+
+```json
+{
+  "schema": "scadalgeria.direct-firmware.connection",
+  "schemaVersion": 1,
+  "connection": {
+    "sourceId": "...",
+    "enabled": true
+  },
+  "identity": {
+    "keyId": "..."
+  },
+  "mqtt": {
+    "protocol": "3.1.1",
+    "cleanSession": true,
+    "broker": {
+      "host": "...",
+      "port": 1883,
+      "transport": "tcp"
+    },
+    "clientIdRequirement": "unique-per-active-session",
+    "username": "...",
+    "topics": {
+      "authenticationChallenge": ".../{clientId}/auth/challenge",
+      "authenticationResponse": ".../{clientId}/auth/response",
+      "telemetry": ".../tags",
+      "commands": ".../commands",
+      "commandResults": ".../commands/result"
+    },
+    "qos": {
+      "telemetry": 1,
+      "commands": 1,
+      "commandResults": 1
+    }
+  },
+  "authentication": { "scheme": "HMAC-SHA256" },
+  "encryption": {
+    "scheme": "AES-256-GCM",
+    "sessionKeyDerivation": {
+      "algorithm": "HKDF-SHA256",
+      "info": "SCADA-ENC-v1"
+    }
+  },
+  "tags": [
+    { "address": "di.input1", "dataType": "Boolean", "direction": "Input" },
+    { "address": "do.output1", "dataType": "Boolean", "direction": "Output" }
+  ],
+  "secrets": {
+    "apiKeySecretIncluded": false
+  }
+}
+```
+
+> 🔐 **Configuration is not the credential.** The copied JSON contains the key **ID**, username, topics, protocol/policy metadata, and tags, but not the API-key **secret**. The secret is the HMAC/HKDF root key and remains a separate provisioning input.
+
+### Client ID and authentication topics
+
+The copied configuration intentionally contains authentication topic **templates** with `{clientId}` and declares `clientIdRequirement: "unique-per-active-session"`.
+
+Each example therefore:
 
 ```text
-                         SCADALGERIA
-                              │
-                              │
-                    MQTT connection starts
-                              │
-                              ▼
-                    Authentication challenge
-                              │
-                              ▼
-                  ┌───────────────────────┐
-                  │ External Python Tool  │
-                  └───────────────────────┘
-                              │
-                              │ HMAC authentication response
-                              ▼
-                         SCADALGERIA
-                              │
-                              │
-                    Session authenticated
-                              │
-                              ▼
-                  AES session key established
-                              │
-             ┌────────────────┴────────────────┐
-             │                                 │
-             │                                 │
-             ▼                                 ▼
-      TELEMETRY FLOW                     COMMAND FLOW
-             │                                 │
-             │                                 │
-     Generate sine wave                SCADALGERIA sends
-             │                         encrypted command
-             ▼                                 │
-     Create telemetry                          ▼
-             │                         Python tool decrypts
-             ▼                                 │
-     Encrypt telemetry                         ▼
-             │                         Execute command
-             ▼                                 │
-     Publish to SCADALGERIA                    ▼
-             │                         Create command result
-             │                                 │
-             │                                 ▼
-             │                         Encrypt command result
-             │                                 │
-             │                                 ▼
-             │                         Publish to SCADALGERIA
-             │                                 │
-             └────────────────┬────────────────┘
-                              │
-                              ▼
-                         Continue running
-                              │
-                              ▼
-                  Send telemetry every second
+1. generates one cryptographically random ClientId for the running client instance;
+2. replaces exactly one {clientId} placeholder in authenticationChallenge;
+3. replaces exactly one {clientId} placeholder in authenticationResponse;
+4. uses telemetry, commands, and commandResults exactly as copied;
+5. never reconstructs tenant/project/source topic paths itself.
 ```
 
-The MQTT connection remains active while telemetry and command handling operate at the same time.
+A reconnect by the same running client may reuse its generated ClientId; two simultaneously active clients must not share a ClientId.
 
----
+### Configuration inputs used by this host example
 
-# Example Signal
+| Input | Purpose | Secret? |
+|---|---|---:|
+| `scadalgeria-connection.json` | Exact Connection Copy JSON | No |
+| `SCADALGERIA_CONFIG_FILE` | Optional path override for the JSON file | No |
+| `SCADALGERIA_API_KEY` | Full source-bound API-key secret | **Yes** |
+| `SCADALGERIA_GPIO_CHIP` | Optional Linux GPIO-chip override where applicable | No |
 
-The Python application generates a sine wave continuously.
+The code deliberately has no environment variables for broker host, key ID, MQTT username, ClientId, or topics; those values come from the copied JSON.
 
-Default configuration:
+## 🔐 Authentication and encryption, byte-for-byte
+
+Challenge payload:
 
 ```text
-Publish interval:  1 second
-Wave period:       300 seconds
-Center:            50
-Amplitude:         40
+[ ServerNonce:bin16, ExpiresAtUnixMs:int64 ]
 ```
 
-The generated value is:
+Proof:
 
 ```text
-value = center + amplitude × sin(2π × elapsed_time / period)
+ClientNonce = CSPRNG(16)
+Auth = HMAC-SHA256(
+    key     = UTF8(fullApiKeyToken),
+    message = ServerNonce || ClientNonce || UTF8(ClientId)
+)
 ```
 
-With the default configuration:
+Response payload:
 
 ```text
-Minimum value: 10
-Maximum value: 90
-Full cycle:    5 minutes
-Samples/cycle: 300
+[ ClientNonce:bin16, Auth:bin32 ]
 ```
 
-The resulting telemetry approximately follows:
+Session key:
 
 ```text
-Time         Value
-
-0 sec          50
-75 sec         90
-150 sec        50
-225 sec        10
-300 sec        50
-375 sec        90
-450 sec        50
-...            ...
+HKDF-SHA256(
+    IKM    = UTF8(fullApiKeyToken),
+    salt   = ServerNonce || ClientNonce,
+    info   = UTF8("SCADA-ENC-v1"),
+    length = 32
+)
 ```
 
-The wave continues indefinitely.
-
----
-
-# SCADALGERIA Configuration
-
-The values obtained from SCADALGERIA are kept together near the top of the Python file.
-
-```python
-MQTT_HOST = "your-vps-ip-or-domain"
-MQTT_PORT = 1883
-
-TENANT_ID = "..."
-PROJECT_ID = "..."
-
-SOURCE_ID = "..."
-
-API_KEY_ID = "..."
-API_KEY_SECRET = "..."
-
-TAG_ADDRESS = "sine_wave"
-```
-
-These values identify the SCADALGERIA tenant, project, MQTT source, API key, and telemetry address used by the external application.
-
-The `TAG_ADDRESS` must correspond to an address configured for the selected source in SCADALGERIA.
-
----
-
-# Code Structure
-
-The example is divided into nine sections.
-
-## Step 1 — Imports
-
-Loads the Python modules required for:
-
-- MQTT communication.
-- MessagePack serialization.
-- Authentication.
-- Encryption.
-- Timing.
-- Sine-wave generation.
-
-No SCADALGERIA connection is performed in this section.
-
----
-
-## Step 2 — Values From SCADALGERIA
-
-Contains the configuration supplied by SCADALGERIA:
+Encrypted envelope:
 
 ```text
-MQTT host
-MQTT port
-Tenant ID
-Project ID
-Source ID
-API key ID
-API key secret
-Tag address
+[ KeyId, Nonce:bin12, Ciphertext:bin, GcmTag:bin16, Seq:uint64, TsUnixMs:uint64 ]
 ```
 
-Keeping these values together makes it clear which configuration belongs to SCADALGERIA and which settings belong only to the example application.
+Use a **fresh cryptographically random 12-byte GCM nonce** for every envelope. Never reuse a `(session key, nonce)` pair. `Seq` is a different control: it is the monotonically increasing device→platform replay sequence and must survive reconnects/reboots/power loss.
 
----
+## 📡 Payloads used by this example
 
-## Step 3 — Local Application Settings
-
-Defines the behavior of the sine-wave generator.
-
-For example:
-
-```python
-SEND_EVERY_SECONDS = 1.0
-
-sine_period = 300.0
-sine_center = 50.0
-sine_amplitude = 40.0
-```
-
-These values are controlled by the external application.
-
-They are not SCADALGERIA credentials.
-
----
-
-## Step 4 — MQTT Identity and Topics
-
-Builds the MQTT identity and topic names required by SCADALGERIA.
-
-The external application derives:
+Digital input telemetry is sent as numeric `0.0` / `1.0` with Good quality:
 
 ```text
-MQTT client ID
-MQTT username
-Authentication challenge topic
-Authentication response topic
-Telemetry topic
-Command topic
-Command result topic
+TagFrameBatchDto = [ Frames, TraceId|null, 1 ]
+TagFrameDto      = [ "di.input1", ValNum, null, 0, 192 ]
 ```
 
-The main application therefore does not need to manually construct MQTT topic strings every time it sends or receives data.
+`TsUnixMs=0` inside the tag frame asks the platform to stamp capture time for Direct Firmware. The **outer envelope timestamp must still be current UTC milliseconds**.
 
----
-
-## Step 5 — Authentication
-
-SCADALGERIA uses a challenge-response process instead of sending the API key secret directly as the MQTT password.
-
-The process is:
+The output command is expected on `do.output1`:
 
 ```text
-MQTT CONNECT
-     │
-     ▼
-SCADALGERIA sends challenge
-     │
-     ▼
-Python generates client nonce
-     │
-     ▼
-HMAC-SHA256 proof generated
-     │
-     ▼
-Authentication response published
-     │
-     ▼
-HKDF-SHA256 derives session key
-     │
-     ▼
-Encrypted MQTT session is ready
+CommandDto = [
+  Id, TagAddress, Value, Timestamp, ExpiryEpochSeconds,
+  LeasedUntil|null, TraceId|null,
+  RequiresConfirmation, Confirmed, 2
+]
 ```
 
-The API key secret proves that the external application is authorized without transmitting that secret as the MQTT password.
-
----
-
-## Step 6 — Send Telemetry
-
-The sine-wave value is converted into the SCADALGERIA telemetry structure.
-
-The process is:
+The snippet rejects expired/unconfirmed/unsupported commands, writes only `0` or `1`, and sends:
 
 ```text
-Python numeric value
-        │
-        ▼
-SCADALGERIA telemetry structure
-        │
-        ▼
-MessagePack
-        │
-        ▼
-AES-256-GCM encryption
-        │
-        ▼
-MQTT telemetry publish
-        │
-        ▼
-SCADALGERIA
+CommandResultDto = [ CommandId, Success, ErrorMessage|null, Data|null, 1 ]
 ```
 
-The main loop only needs to call:
+The same command `Id` can be delivered more than once. This example caches a final result so ordinary redelivery is answered without repeating the handler. The demonstrated output is an **idempotent set-state operation** (`0`/`1`). For a non-idempotent physical action, a result cache alone cannot guarantee exactly-once behavior across a power loss between actuation and persistence; use a durable command journal/state machine and reconcile an incomplete operation before accepting redelivery.
 
-```python
-send_value(client, value)
-```
+## ⚠️ Warnings: Platform rejection / abuse rules to design around
 
-The serialization and encryption details remain inside the telemetry functions.
+| Bad client behavior | Expected consequence |
+|---|---|
+| MQTT 5, `CleanSession=false`, malformed canonical identity | CONNECT rejection |
+| Subscribing to command/wildcard topics before auth | subscription rejection / disconnect |
+| Invalid, expired, revoked, wrong-source key | authorization failure |
+| Wrong HMAC proof / malformed auth response / expired challenge | auth failure / disconnect |
+| Wrong tenant/project/source topic | source-identity ACL violation |
+| Wrong envelope `KeyId`, bad GCM tag, malformed envelope | crypto rejection; repeated abuse can disconnect |
+| Reset/replayed `Seq` or stale outer timestamp | replay/stale drop |
+| Unknown tag, duplicate address, invalid quality/type/range, reserved `$sys.*` | atomic telemetry batch rejection |
+| Sustained rate/burst excess | rate-limit drops, then abuse disconnect/cooldown |
+| Tight reconnect loop | avoid; use exponential backoff + jitter |
 
----
+A local MQTT `publish()`/PUBACK only proves MQTT transport progress. It does **not** prove the platform accepted the telemetry semantically. Use platform readback/observability when validating an integration.
 
-## Step 7 — Receive Commands
 
-The external application subscribes to its SCADALGERIA command topic.
+## 📦 Runtime and package versions
 
-When a command arrives:
+| Component | Version | Official documentation |
+|---|---:|---|
+| Python | **3.15.2** | [python.org release](https://www.python.org/downloads/release/python-3152/) |
+| paho-mqtt | **2.1.0** | [PyPI](https://pypi.org/project/paho-mqtt/2.1.0/) · [Paho docs](https://eclipse.dev/paho/files/paho.mqtt.python/html/) |
+| msgpack | **1.2.4** | [PyPI](https://pypi.org/project/msgpack/1.2.4/) |
+| cryptography | **50.0.2** | [PyPI](https://pypi.org/project/cryptography/50.0.2/) · [AEAD docs](https://cryptography.io/en/latest/hazmat/primitives/aead/) |
+| gpiod | **2.5.0** | [PyPI](https://pypi.org/project/gpiod/2.5.0/) |
 
-```text
-SCADALGERIA command
-        │
-        ▼
-Encrypted MQTT payload
-        │
-        ▼
-AES-256-GCM decryption
-        │
-        ▼
-MessagePack decoding
-        │
-        ▼
-Command available to Python
-```
-
-The command can then be passed to the execution step.
-
----
-
-## Step 8 — Execute Commands and Send Results
-
-The example supports three demonstration commands:
-
-```text
-sine.amplitude
-sine.center
-sine.period
-```
-
-For example:
-
-```text
-sine.amplitude = 20
-```
-
-changes the generated sine-wave amplitude.
-
-A command follows this flow:
-
-```text
-Command received
-      │
-      ▼
-Validate command
-      │
-      ▼
-Execute requested change
-      │
-      ▼
-Create command result
-      │
-      ▼
-Encrypt result
-      │
-      ▼
-Publish result
-      │
-      ▼
-SCADALGERIA
-```
-
-The example therefore demonstrates both directions of communication:
-
-```text
-Python → SCADALGERIA telemetry
-
-SCADALGERIA → Python command
-
-Python → SCADALGERIA command result
-```
-
----
-
-## Step 9 — Main Loop
-
-The final section starts the external application.
-
-Its responsibility is intentionally simple:
-
-```text
-Connect
-   │
-   ▼
-Authenticate
-   │
-   ▼
-Subscribe to commands
-   │
-   ▼
-Generate sine-wave value
-   │
-   ▼
-Send telemetry
-   │
-   ▼
-Wait one second
-   │
-   └───────────────► Repeat forever
-```
-
-MQTT processing runs alongside the telemetry loop, allowing SCADALGERIA commands to be received while the sine wave continues to be generated.
-
----
-
-# Complete Runtime Flow
-
-The complete application lifecycle can be summarized as:
-
-```text
-START
-  │
-  ▼
-Load SCADALGERIA configuration
-  │
-  ▼
-Create MQTT client
-  │
-  ▼
-Connect to SCADALGERIA
-  │
-  ▼
-Authenticate
-  │
-  ▼
-Derive encrypted session key
-  │
-  ▼
-Subscribe to commands
-  │
-  ▼
-┌──────────────────────────────────────────────┐
-│                RUN CONTINUOUSLY              │
-│                                              │
-│  Generate sine wave                         │
-│         │                                    │
-│         ▼                                    │
-│  Send encrypted telemetry ──► SCADALGERIA   │
-│                                              │
-│  SCADALGERIA command ───────► Receive        │
-│                                  │           │
-│                                  ▼           │
-│                               Execute        │
-│                                  │           │
-│                                  ▼           │
-│  SCADALGERIA ◄──────── Send command result  │
-│                                              │
-└──────────────────────────────────────────────┘
-```
-
----
-
-# Running the Example
-
-After entering the required SCADALGERIA configuration values, start the application with:
+Install the exact package versions used by the snippet:
 
 ```bash
-python scadalgeria_mqtt_example.py
+python -m pip install \
+  paho-mqtt==2.1.0 \
+  msgpack==1.2.4 \
+  cryptography==50.0.2 \
+  gpiod==2.5.0
 ```
 
-A successful session will conceptually progress through:
+## 🧩 Package APIs used by the snippet
+
+The following signatures are the concrete API shapes used by this example (or the small adapter contract the snippet defines when a package does not provide a SCADALGERIA-specific helper).
+
+```python
+json.loads(text) -> object
+Path("scadalgeria-connection.json").read_text(encoding="utf-8") -> str
+mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt.MQTTv311, clean_session=True)
+Client.username_pw_set(username, password="")
+Client.connect(host, port, keepalive=60)
+Client.subscribe(topic, qos=1) -> (result, mid)
+Client.on_subscribe = callback(client, userdata, mid, reason_code_list, properties)
+# For each exact SCADALGERIA subscription this example requires reason_code_list[0].value == 1.
+Client.publish(topic, payload, qos=1, retain=False) -> MQTTMessageInfo
+
+msgpack.packb(value, use_bin_type=True) -> bytes
+msgpack.unpackb(payload, raw=False, timestamp=3) -> object
+
+HKDF(algorithm=hashes.SHA256(), length=32, salt=server_nonce + client_nonce, info=b"SCADA-ENC-v1").derive(token_bytes) -> bytes
+AESGCM(session_key).encrypt(nonce12, plaintext, aad16) -> ciphertext_plus_tag
+AESGCM(session_key).decrypt(nonce12, ciphertext_plus_tag, aad16) -> plaintext
+
+input_settings = gpiod.LineSettings(direction=Direction.INPUT, bias=Bias.PULL_UP)
+output_settings = gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE)
+gpiod.request_lines("/dev/gpiochip0", consumer="scadalgeria-example", config={17: input_settings, 27: output_settings}) -> LineRequest
+LineRequest.get_value(offset) -> Value
+LineRequest.set_value(offset, Value.ACTIVE | Value.INACTIVE)
+```
+
+## 🔌 Digital I/O target
+
+Raspberry Pi 5 / Raspberry Pi OS 64-bit. The snippet uses BCM GPIO **17** as an active-low switch input (`PULL_UP`, switch to GND) and BCM GPIO **27** as the output. `SCADA_GPIO_CHIP` defaults to `/dev/gpiochip0`; on Raspberry Pi 5 verify the exposed chip with `gpioinfo` and override it if the kernel presents the GPIO controller elsewhere. `di.input1=1` means the switch is asserted/closed. Connect only a current-limited LED or correctly isolated logic input to the output GPIO.
+
+
+
+## ✅ Recommended device flow
 
 ```text
-Connected to SCADALGERIA
-Authenticated
-Subscribed to commands
-Starting sine wave
-
-Telemetry: 50.00
-Telemetry: 50.84
-Telemetry: 51.67
-Telemetry: 52.51
-...
+1. Load Connection Copy JSON + separately protected API key
+2. Restore durable outgoing Seq and command-result cache
+3. Connect MQTT 3.1.1 with CleanSession=true
+4. Subscribe ONLY to authChallenge at QoS 1
+5. Validate challenge expiry
+6. Create ClientNonce + HMAC proof; derive session key
+7. Publish authResponse at QoS 1
+8. Subscribe to exact commands topic at QoS 1
+9. Read di.input1 and publish encrypted telemetry
+10. On command: validate schema/address/expiry/confirmation
+11. Return cached result if command ID was already executed
+12. Otherwise write do.output1 once, durably remember result, publish result
+13. On reconnect: discard session key, repeat auth; DO NOT reset Seq
 ```
 
-The application continues sending one telemetry sample every second while remaining available for SCADALGERIA commands.
 
----
+## 🛡️ Production remarks
 
-# Purpose of the Example
+- Store the root API token in the strongest secret storage available on the target; never log it, put it in MQTT topics, telemetry, URLs, crash dumps, or the MQTT password.
+- Persist `Seq` **before** using it for a new logical device→platform message. Skipping a number after a crash is safe; reusing a number is not.
+- On **every MQTT reconnect**, clear the authenticated flag and old session key, repeat challenge authentication, and derive a new session key; never reuse ciphertext or a previous session key across sessions.
+- Port `1883` is plain TCP in the Direct Firmware endpoint. Payloads are application-encrypted, but MQTT metadata is visible; production deployments should restrict device egress/source IPs or use an approved private tunnel or use an approved private tunnel/VPN when transport-level protection is required.
+- Keep UTC synchronized. Authentication challenge expiry and the encrypted envelope replay window are time-sensitive.
+- Enforce `telemetryPolicy` from the copied connection configuration: batch size, rate, burst, payload size, and clock-skew limits must be treated as authoritative.
+- Bound offline telemetry queues. Do not reconnect and dump an unlimited backlog at the broker.
+- Use exact topics from the copied connection configuration; do not subscribe to `#` or cross-source topics.
+- Back off reconnect/auth failures exponentially with jitter. Repeated invalid proofs, crypto failures, ACL violations, and rate abuse are observable security signals.
+- If an API key has an IP allowlist, NAT/VPN/cellular egress changes can correctly cause authorization failure.
 
-This example is intended to show the minimum structure required for a bidirectional external SCADALGERIA MQTT integration.
 
-It demonstrates:
-
-```text
-SCADALGERIA configuration
-        ↓
-MQTT connection
-        ↓
-Authentication
-        ↓
-Encrypted telemetry
-        ↓
-Command reception
-        ↓
-Command execution
-        ↓
-Encrypted command result
-```
-
-A real device, gateway, PLC adapter, simulator, or external application can replace the sine-wave generator with its actual data acquisition and control logic while keeping the same SCADALGERIA communication structure.
